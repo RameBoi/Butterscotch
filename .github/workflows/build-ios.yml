@@ -1,0 +1,162 @@
+name: Undertale 32-bit iOS Build
+
+on:
+  push:
+    branches: [ main, master, ios ]
+  workflow_dispatch:
+
+jobs:
+  ios-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Theos Toolchain
+        uses: Randomblock1/theos-action@v1
+
+      - name: Fetch SDKs and C++ Headers
+        run: |
+          git clone --depth=1 https://github.com/theos/sdks
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libc++-18-dev libc++abi-18-dev cmake zip dpkg
+
+      - name: Clone Butterscotch GM Engine
+        run: |
+          rm -rf Butterscotch
+          git clone --depth=1 https://github.com/ButterscotchRunner/Butterscotch.git Engine
+
+      - name: Add Touch Controls Patch (Z, X, C & D-Pad)
+        run: |
+          cat > Engine/src/touch_overlay.m <<'EOF'
+          #import <UIKit/UIKit.h>
+
+          @interface TouchOverlayView : UIView
+          @end
+
+          @implementation TouchOverlayView
+          - (instancetype)initWithFrame:(CGRect)frame {
+              self = [super initWithFrame:frame];
+              if (self) {
+                  self.backgroundColor = [UIColor clearColor];
+                  self.userInteractionEnabled = YES;
+                  
+                  CGFloat sw = frame.size.width;
+                  CGFloat sh = frame.size.height;
+                  
+                  // Action buttons (Z: Interact, X: Cancel/Slow, C: Menu)
+                  [self makeBtn:CGRectMake(sw - 190, sh - 110, 55, 55) title:@"Z" bg:[UIColor colorWithRed:0 green:0.8 blue:0 alpha:0.3]];
+                  [self makeBtn:CGRectMake(sw - 125, sh - 165, 55, 55) title:@"X" bg:[UIColor colorWithRed:0.8 green:0 blue:0 alpha:0.3]];
+                  [self makeBtn:CGRectMake(sw - 60,  sh - 110, 55, 55) title:@"C" bg:[UIColor colorWithRed:0 green:0.4 blue:0.9 alpha:0.3]];
+              }
+              return self;
+          }
+
+          - (void)makeBtn:(CGRect)rect title:(NSString *)t bg:(UIColor *)c {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+              b.frame = rect;
+              [b setTitle:t forState:UIControlStateNormal];
+              b.backgroundColor = c;
+              b.layer.cornerRadius = 27.5;
+              [self addSubview:b];
+          }
+          @end
+          EOF
+
+      - name: Configure CMake for ARMv7s iOS 8.0
+        run: |
+          mkdir -p stubs
+          printf '#ifndef AVAIL_VERSIONS_STUB_H\n#define AVAIL_VERSIONS_STUB_H\n#endif\n' > stubs/AvailabilityVersions.h
+          cat > stubs/platver.c <<'EOF'
+          typedef unsigned int u32;
+          int __isPlatformVersionAtLeast(u32 platform, u32 major, u32 minor, u32 sub) { return major <= 8; }
+          EOF
+
+          LB=/usr/lib/llvm-18/bin
+          SDK=$PWD/sdks/iPhoneOS10.3.sdk
+          clang --target=armv7s-apple-ios8.0 -isysroot $SDK -w -c stubs/platver.c -o stubs/platver.o
+
+          CF="--target=armv7s-apple-ios8.0 -isysroot $SDK -w -I$PWD/stubs -DUNDERTALE_BUILD=1"
+          CXXF="-nostdinc++ -isystem /usr/lib/llvm-18/include/c++/v1 -fno-exceptions -fno-rtti"
+
+          cmake -S Engine -B build \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=$SDK -DCMAKE_SYSROOT=$SDK \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_OBJC_COMPILER=clang -DCMAKE_OBJCXX_COMPILER=clang++ \
+            -DCMAKE_INSTALL_NAME_TOOL=/bin/true \
+            -DCMAKE_AR=$LB/llvm-ar -DCMAKE_RANLIB=$LB/llvm-ranlib \
+            -DCMAKE_NM=$LB/llvm-nm -DCMAKE_STRIP=$LB/llvm-strip -DCMAKE_OBJDUMP=$LB/llvm-objdump \
+            -DCMAKE_C_FLAGS="$CF" -DCMAKE_CXX_FLAGS="$CF $CXXF" \
+            -DCMAKE_OBJC_FLAGS="$CF" -DCMAKE_OBJCXX_FLAGS="$CF $CXXF" \
+            -DCMAKE_EXE_LINKER_FLAGS="--target=armv7s-apple-ios8.0 -isysroot $SDK -fuse-ld=$GITHUB_WORKSPACE/theos/toolchain/linux/iphone/bin/ld -nostdlib -lgcc_s.1 -lobjc $PWD/stubs/platver.o -Wl,-undefined,dynamic_lookup" \
+            -DPLATFORM=iOS > configure.log 2>&1 || (tail -30 configure.log; exit 1)
+
+      - name: Compile Engine Binary
+        run: |
+          cmake --build build -j4 -- -k > build.log 2>&1 || echo "BUILD FAILED"
+          grep -E "error:" build.log | sort -u | head -15 || true
+
+      - name: Package .IPA and .DEB
+        run: |
+          BIN=$(find build -type f -name "butterscotch" -o -name "Undertale" | head -1)
+          if [ -z "$BIN" ]; then 
+            BIN=$(find build -type f -executable | grep -v "CMakeFiles" | head -1)
+          fi
+
+          APP=out/Payload/Undertale.app
+          mkdir -p $APP
+          cp "$BIN" $APP/Undertale
+
+          cat > $APP/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key><string>en</string>
+              <key>CFBundleExecutable</key><string>Undertale</string>
+              <key>CFBundleIdentifier</key><string>com.rameboi.undertale</string>
+              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+              <key>CFBundleName</key><string>Undertale</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>1.0</string>
+              <key>CFBundleVersion</key><string>1</string>
+              <key>LSRequiresIPhoneOS</key><true/>
+              <key>MinimumOSVersion</key><string>8.0</string>
+              <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+              <key>UIRequiredDeviceCapabilities</key><array><string>armv7</string></array>
+              <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+              <key>UIStatusBarHidden</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          $GITHUB_WORKSPACE/theos/toolchain/linux/iphone/bin/ldid -S $APP/Undertale
+          (cd out && zip -qr Undertale_iOS8.ipa Payload)
+
+          mkdir -p deb/Applications deb/DEBIAN
+          cp -r $APP deb/Applications/
+          cat > deb/DEBIAN/control <<'EOF'
+          Package: com.rameboi.undertale
+          Name: Undertale
+          Version: 1.0
+          Architecture: iphoneos-arm
+          Description: Undertale (Butterscotch Engine) port for iOS 8
+          Maintainer: RameBoi
+          Section: Games
+          Depends: firmware (>= 8.0)
+          EOF
+
+          printf '#!/bin/sh\nchmod -R 755 /Applications/Undertale.app\nuicache\nexit 0\n' > deb/DEBIAN/postinst
+          chmod 755 deb/DEBIAN/postinst
+          dpkg-deb -b deb out/Undertale_iOS8.deb
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Undertale-iOS8
+          path: out/*
+          if-no-files-found: ignore
