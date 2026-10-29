@@ -39,8 +39,14 @@ jobs:
           p = "CMakeLists.txt"
           s = open(p).read()
 
-          # iOS 6+ instead of iOS 17+
-          s = s.replace(
+          def must_replace(old, new):
+              global s
+              if old not in s:
+                  raise SystemExit(f"PATCH FAILED: could not find:\n{old}")
+              s = s.replace(old, new)
+
+          # 1. iOS 6+ instead of iOS 17+
+          must_replace(
               'set(CMAKE_OSX_DEPLOYMENT_TARGET "17.0" CACHE STRING "Minimum iOS version")',
               'set(CMAKE_OSX_DEPLOYMENT_TARGET "6.0" CACHE STRING "Minimum iOS version")'
           )
@@ -52,37 +58,46 @@ jobs:
               flags=re.S
           )
 
-          # No Swift
-          s = s.replace(
+          # 2. Remove Swift
+          must_replace(
               'enable_language(OBJC OBJCXX Swift)',
               'enable_language(OBJC OBJCXX)'
           )
 
-          # Force OpenGL ES renderer; disable Metal
-          s = s.replace(
-              'set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer")',
-              'set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer")\nset(ENABLE_MODERN_GL ON CACHE BOOL "Enable OpenGL ES renderer" FORCE)\nset(ENABLE_METAL OFF CACHE BOOL "Enable Metal renderer" FORCE)'
+          # 3. Force OpenGL ES and disable Metal
+          must_replace(
+              'option(ENABLE_METAL "Enable the Metal renderer" ON)',
+              'option(ENABLE_METAL "Enable the Metal renderer" OFF)'
           )
 
-          # Remove Metal framework requirement
-          s = s.replace(
+          # Remove the block that disables Modern GL when Metal is enabled
+          s = re.sub(
+              r'if\(ENABLE_METAL\)\s*\n\s*set\(ENABLE_MODERN_GL OFF[^\n]*\nendif\(\)',
+              '',
+              s
+          )
+
+          # 4. Remove Metal framework requirement
+          must_replace(
               '    find_library(IOS_METAL_FRAMEWORK Metal REQUIRED)\n',
               ''
           )
 
-          # Remove frameworks unavailable/unnecessary on iOS 8
+          # 5. Remove iOS frameworks not needed / unavailable on iOS 8
           for line in [
               '    find_library(IOS_PHOTOS_FRAMEWORK Photos REQUIRED)\n',
               '    find_library(IOS_PHOTOSUI_FRAMEWORK PhotosUI REQUIRED)\n',
               '    find_library(IOS_UNIFORMTYPEIDENTIFIERS_FRAMEWORK UniformTypeIdentifiers REQUIRED)\n',
               '    find_library(IOS_VIDEOTOOLBOX_FRAMEWORK VideoToolbox REQUIRED)\n',
           ]:
-              s = s.replace(line, '')
+              must_replace(line, '')
 
-          # Remove FFmpeg define
-          s = s.replace('        USE_FFMPEG\n', '')
+          # 6. Disable FFmpeg completely
+          must_replace(
+              '        USE_FFMPEG\n',
+              ''
+          )
 
-          # Remove entire FFmpeg download section
           s = re.sub(
               r'# FFmpeg\n.*?add_library\(stb_ds INTERFACE\)',
               'add_library(stb_ds INTERFACE)',
@@ -90,11 +105,26 @@ jobs:
               flags=re.S
           )
 
-          # Remove Swift source glob and generated Swift file
-          s = s.replace('    src/ios/swift/*.swift\n', '')
-          s = s.replace('        ${BUILD_INFO_SWIFT}\n', '')
+          for line in [
+              '        "${FFMPEG_DIR}/avcodec/avcodec.xcframework"\n',
+              '        "${FFMPEG_DIR}/avformat/avformat.xcframework"\n',
+              '        "${FFMPEG_DIR}/avutil/avutil.xcframework"\n',
+              '        "${FFMPEG_DIR}/swscale/swscale.xcframework"\n',
+              '        "${FFMPEG_DIR}/swresample/swresample.xcframework"\n',
+          ]:
+              must_replace(line, '')
 
-          # Remove Swift build-info generation
+          # 7. Remove Swift sources and generated Swift file
+          must_replace(
+              '    src/ios/swift/*.swift\n',
+              ''
+          )
+
+          must_replace(
+              '        ${BUILD_INFO_SWIFT}\n',
+              ''
+          )
+
           s = re.sub(
               r'    # Make commit information available to Swift\n.*?\nendif\(\)',
               '',
@@ -102,21 +132,14 @@ jobs:
               flags=re.S
           )
 
-          # Remove Metal/Photos/FFmpeg link lines
-          for line in [
-              '        ${IOS_PHOTOS_FRAMEWORK}\n',
-              '        ${IOS_PHOTOSUI_FRAMEWORK}\n',
-              '        ${IOS_UNIFORMTYPEIDENTIFIERS_FRAMEWORK}\n',
-              '        ${IOS_VIDEOTOOLBOX_FRAMEWORK}\n',
-              '        "${FFMPEG_DIR}/avcodec/avcodec.xcframework"\n',
-              '        "${FFMPEG_DIR}/avformat/avformat.xcframework"\n',
-              '        "${FFMPEG_DIR}/avutil/avutil.xcframework"\n',
-              '        "${FFMPEG_DIR}/swscale/swscale.xcframework"\n',
-              '        "${FFMPEG_DIR}/swresample/swresample.xcframework"\n',
-          ]:
-              s = s.replace(line, '')
+          # 8. Use vendored SDL2 instead of Linux pkg-config SDL2
+          s = re.sub(
+              r'pkg_check_modules\(SDL2[^)]*\)',
+              'set(SDL2_INCLUDE_DIRS "${CMAKE_SOURCE_DIR}/vendor/SDL2/include" "${CMAKE_SOURCE_DIR}/vendor/SDL2/include/SDL2")',
+              s
+          )
 
-          # Remove asset catalog / Xcode-only packaging
+          # 9. Remove Xcode-only asset catalog packaging
           s = re.sub(
               r'    # iOS asset catalog\n.*?\nendif\(\)\n\n\nmessage\(STATUS ""\)',
               '\nmessage(STATUS "")',
@@ -126,11 +149,11 @@ jobs:
 
           open(p, "w").write(s)
 
-          print("Patched CMakeLists.txt")
+          print("Patched CMakeLists.txt successfully")
           PY
 
           echo "=== Renderer settings ==="
-          grep -n "ENABLE_MODERN_GL\|ENABLE_METAL\|OpenGLES\|Metal" CMakeLists.txt || true
+          grep -n "ENABLE_MODERN_GL\|ENABLE_METAL\|OpenGLES\|Metal\|pkg_check_modules\|SDL2_INCLUDE_DIRS" CMakeLists.txt || true
 
       - name: Configure armv7 iOS 8 OpenGL ES build
         run: |
