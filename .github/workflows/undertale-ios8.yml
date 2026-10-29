@@ -1,0 +1,289 @@
+name: undertale-ios8
+
+on:
+  push:
+    branches: [ios8-armv7]
+  workflow_dispatch:
+
+jobs:
+  ios8:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Theos
+        uses: Randomblock1/theos-action@v1
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            cmake ninja-build \
+            libc++-18-dev libc++abi-18-dev \
+            zip unzip xz-utils file
+
+      - name: Get iOS SDK
+        run: |
+          git clone --depth=1 https://github.com/theos/sdks
+          ls -la sdks/iPhoneOS10.3.sdk
+
+      - name: Patch for iOS 8 armv7 + OpenGL ES
+        run: |
+          python3 - <<'PY'
+          import re
+
+          p = "CMakeLists.txt"
+          s = open(p).read()
+
+          # iOS 6+ instead of iOS 17+
+          s = s.replace(
+              'set(CMAKE_OSX_DEPLOYMENT_TARGET "17.0" CACHE STRING "Minimum iOS version")',
+              'set(CMAKE_OSX_DEPLOYMENT_TARGET "6.0" CACHE STRING "Minimum iOS version")'
+          )
+
+          s = re.sub(
+              r'if\(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "17\.0"\).*?endif\(\)',
+              '',
+              s,
+              flags=re.S
+          )
+
+          # No Swift
+          s = s.replace(
+              'enable_language(OBJC OBJCXX Swift)',
+              'enable_language(OBJC OBJCXX)'
+          )
+
+          # Force OpenGL ES renderer; disable Metal
+          s = s.replace(
+              'set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer")',
+              'set(ENABLE_LEGACY_GL OFF CACHE BOOL "Enable the legacy OpenGL renderer")\nset(ENABLE_MODERN_GL ON CACHE BOOL "Enable OpenGL ES renderer" FORCE)\nset(ENABLE_METAL OFF CACHE BOOL "Enable Metal renderer" FORCE)'
+          )
+
+          # Remove Metal framework requirement
+          s = s.replace(
+              '    find_library(IOS_METAL_FRAMEWORK Metal REQUIRED)\n',
+              ''
+          )
+
+          # Remove frameworks unavailable/unnecessary on iOS 8
+          for line in [
+              '    find_library(IOS_PHOTOS_FRAMEWORK Photos REQUIRED)\n',
+              '    find_library(IOS_PHOTOSUI_FRAMEWORK PhotosUI REQUIRED)\n',
+              '    find_library(IOS_UNIFORMTYPEIDENTIFIERS_FRAMEWORK UniformTypeIdentifiers REQUIRED)\n',
+              '    find_library(IOS_VIDEOTOOLBOX_FRAMEWORK VideoToolbox REQUIRED)\n',
+          ]:
+              s = s.replace(line, '')
+
+          # Remove FFmpeg define
+          s = s.replace('        USE_FFMPEG\n', '')
+
+          # Remove entire FFmpeg download section
+          s = re.sub(
+              r'# FFmpeg\n.*?add_library\(stb_ds INTERFACE\)',
+              'add_library(stb_ds INTERFACE)',
+              s,
+              flags=re.S
+          )
+
+          # Remove Swift source glob and generated Swift file
+          s = s.replace('    src/ios/swift/*.swift\n', '')
+          s = s.replace('        ${BUILD_INFO_SWIFT}\n', '')
+
+          # Remove Swift build-info generation
+          s = re.sub(
+              r'    # Make commit information available to Swift\n.*?\nendif\(\)',
+              '',
+              s,
+              flags=re.S
+          )
+
+          # Remove Metal/Photos/FFmpeg link lines
+          for line in [
+              '        ${IOS_PHOTOS_FRAMEWORK}\n',
+              '        ${IOS_PHOTOSUI_FRAMEWORK}\n',
+              '        ${IOS_UNIFORMTYPEIDENTIFIERS_FRAMEWORK}\n',
+              '        ${IOS_VIDEOTOOLBOX_FRAMEWORK}\n',
+              '        "${FFMPEG_DIR}/avcodec/avcodec.xcframework"\n',
+              '        "${FFMPEG_DIR}/avformat/avformat.xcframework"\n',
+              '        "${FFMPEG_DIR}/avutil/avutil.xcframework"\n',
+              '        "${FFMPEG_DIR}/swscale/swscale.xcframework"\n',
+              '        "${FFMPEG_DIR}/swresample/swresample.xcframework"\n',
+          ]:
+              s = s.replace(line, '')
+
+          # Remove asset catalog / Xcode-only packaging
+          s = re.sub(
+              r'    # iOS asset catalog\n.*?\nendif\(\)\n\n\nmessage\(STATUS ""\)',
+              '\nmessage(STATUS "")',
+              s,
+              flags=re.S
+          )
+
+          open(p, "w").write(s)
+
+          print("Patched CMakeLists.txt")
+          PY
+
+          echo "=== Renderer settings ==="
+          grep -n "ENABLE_MODERN_GL\|ENABLE_METAL\|OpenGLES\|Metal" CMakeLists.txt || true
+
+      - name: Configure armv7 iOS 8 OpenGL ES build
+        run: |
+          mkdir -p stubs
+          printf '#ifndef AVAIL_VERSIONS_STUB_H\n#define AVAIL_VERSIONS_STUB_H\n#endif\n' > stubs/AvailabilityVersions.h
+
+          cat > stubs/platver.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #include <stdio.h>
+
+          int __isPlatformVersionAtLeast(unsigned int platform, unsigned int major, unsigned int minor, unsigned int sub)
+          {
+              static int cur[3] = { -1, 0, 0 };
+              if (cur[0] < 0) {
+                  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+                  const char *v = [[[UIDevice currentDevice] systemVersion] UTF8String];
+                  int a = 0, b = 0, c = 0;
+                  sscanf(v, "%d.%d.%d", &a, &b, &c);
+                  cur[0] = a;
+                  cur[1] = b;
+                  cur[2] = c;
+                  [pool release];
+              }
+
+              if (cur[0] != (int)major)
+                  return cur[0] > (int)major;
+              if (cur[1] != (int)minor)
+                  return cur[1] > (int)minor;
+              return cur[2] >= (int)sub;
+          }
+          EOF
+
+          SDK="$PWD/sdks/iPhoneOS10.3.sdk"
+          T="armv7-apple-ios6.0"
+          LB="/usr/lib/llvm-18/bin"
+
+          clang --target="$T" -isysroot "$SDK" -w -c stubs/platver.m -o stubs/platver.o
+
+          CF="--target=$T -isysroot=$SDK -w"
+          CXXF="$CF -nostdinc++ -isystem=/usr/lib/llvm-18/include/c++/v1"
+
+          LINKFLAGS="--target=$T -isysroot=$SDK -fuse-ld=$GITHUB_WORKSPACE/theos/toolchain/linux/iphone/bin/ld -nostdlib -lgcc_s.1 -lobjc $PWD/stubs/platver.o -Wl,-undefined,dynamic_lookup -Wl,-framework,Foundation -Wl,-framework,UIKit -Wl,-framework,CoreGraphics -Wl,-framework,QuartzCore -Wl,-framework,OpenGLES -Wl,-framework,AudioToolbox -Wl,-framework,AudioUnit -Wl,-framework,CoreAudio -Wl,-framework,CoreFoundation -Wl,-framework,CoreText"
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="$SDK" \
+            -DCMAKE_SYSROOT="$SDK" \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_OBJC_COMPILER=clang \
+            -DCMAKE_OBJCXX_COMPILER=clang++ \
+            -DCMAKE_AR="$LB/llvm-ar" \
+            -DCMAKE_RANLIB="$LB/llvm-ranlib" \
+            -DCMAKE_NM="$LB/llvm-nm" \
+            -DCMAKE_STRIP="$LB/llvm-strip" \
+            -DCMAKE_OBJDUMP="$LB/llvm-objdump" \
+            -DCMAKE_C_FLAGS="$CF" \
+            -DCMAKE_CXX_FLAGS="$CXXF" \
+            -DCMAKE_OBJC_FLAGS="$CF" \
+            -DCMAKE_OBJCXX_FLAGS="$CXXF" \
+            -DCMAKE_EXE_LINKER_FLAGS="$LINKFLAGS" \
+            -DBACKEND=sdl2 \
+            -DAUDIO_BACKEND=miniaudio \
+            -DENABLE_LEGACY_GL=OFF \
+            -DENABLE_MODERN_GL=ON \
+            -DENABLE_METAL=OFF \
+            -DENABLE_WAD14=ON \
+            -DENABLE_WAD16=ON \
+            -DENABLE_WAD17=OFF \
+            > configure.log 2>&1 || { tail -100 configure.log; exit 1; }
+
+          echo "=== CONFIGURE OK ==="
+          tail -40 configure.log
+
+      - name: Build
+        run: |
+          cmake --build build -j4 > build.log 2>&1 || true
+
+          echo "=== ERRORS ==="
+          grep -E "error:|fatal error|undefined symbol|Undefined symbols" build.log | head -100 || true
+
+          echo "=== BINARY ==="
+          BIN="$(find build -type f -name butterscotch | head -1)"
+          if [ -n "$BIN" ]; then
+            file "$BIN"
+          else
+            echo "No butterscotch binary yet"
+          fi
+
+      - name: Package empty test app
+        if: hashFiles('build/**/butterscotch') != ''
+        run: |
+          BIN="$(find build -type f -name butterscotch | head -1)"
+          APP=out/Payload/Undertale.app
+          mkdir -p "$APP"
+
+          cp "$BIN" "$APP/butterscotch"
+          chmod 755 "$APP/butterscotch"
+
+          cat > "$APP/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>butterscotch</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.rameboi.undertale</string>
+              <key>CFBundleName</key>
+              <string>Undertale</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>MinimumOSVersion</key>
+              <string>6.0</string>
+              <key>UIDeviceFamily</key>
+              <array>
+                  <integer>1</integer>
+                  <integer>2</integer>
+              </array>
+              <key>UIRequiredDeviceCapabilities</key>
+              <array>
+                  <string>armv7</string>
+              </array>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>UIStatusBarHidden</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          "$GITHUB_WORKSPACE/theos/toolchain/linux/iphone/bin/ldid" -S "$APP/butterscotch"
+
+          cd out
+          zip -qr Undertale_iOS8_OpenGLES_test.ipa Payload
+
+      - name: Upload logs and app
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: undertale-ios8-opengles
+          path: |
+            configure.log
+            build.log
+            out/
+          if-no-files-found: ignore
